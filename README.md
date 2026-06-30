@@ -99,6 +99,8 @@ vllm serve /path/to/t5gemma-2-1b-1b.dflash \
 vLLM reads the Speculators config from the checkpoint, loads the verifier
 `google/t5gemma-2-1b-1b`, and enables DFlash speculative decoding.
 
+For example you can try [d0rj/t5gemma-2-1b-1b.dflash-dev](https://huggingface.co/d0rj/t5gemma-2-1b-1b.dflash-dev) speculator.
+
 ## Quick request
 
 ```bash
