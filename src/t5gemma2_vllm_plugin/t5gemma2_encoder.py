@@ -45,7 +45,7 @@ from .kernels.fused_rope_global import fused_rope_global_apply
 
 
 def _t5gemma2_use_optimized_paths() -> bool:
-    flag = os.getenv("VLLM_FACTORY_T5GEMMA2_REFERENCE_PATH", "")
+    flag = os.getenv("T5GEMMA2_PLUGIN_REFERENCE_PATH", "")
     return flag.lower() not in {"1", "true", "yes", "on"}
 
 
