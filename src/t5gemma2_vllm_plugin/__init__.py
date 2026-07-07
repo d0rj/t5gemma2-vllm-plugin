@@ -11,6 +11,7 @@ from .processing import (
     T5Gemma2Processor,
 )
 from .vllm_adapter import T5Gemma2VllmForConditionalGeneration
+from .speculators import register_speculators
 
 
 def _register_hf_config(model_type: str, config_cls: type[Any]) -> None:
@@ -58,6 +59,7 @@ def register() -> None:
         T5Gemma2VllmForConditionalGeneration,
     )
     _register_processor(T5Gemma2VllmForConditionalGeneration)
+    register_speculators()
 
 
 __all__ = ["T5Gemma2VllmForConditionalGeneration", "register"]

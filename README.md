@@ -65,10 +65,16 @@ vllm serve google/t5gemma-2-1b-1b \
   --max-num-seqs 1
 ```
 
-## Serve a T5Gemma 2 DFlash checkpoint
+## Serve a T5Gemma 2 DFlash-family checkpoint
 
-The DFlash checkpoint must be in Speculators format and its `config.json` must
-contain:
+The checkpoint must be in Speculators format. The plugin registers T5Gemma 2
+plus these DFlash-family draft architectures:
+
+- `DFlashDraftModel`
+- `DSparkDraftModel`
+- `DFlareDraftModel`
+
+For DFlash, its `config.json` contains:
 
 ```json
 {
@@ -100,6 +106,33 @@ vLLM reads the Speculators config from the checkpoint, loads the verifier
 `google/t5gemma-2-1b-1b`, and enables DFlash speculative decoding.
 
 For example you can try [d0rj/t5gemma-2-1b-1b.dflash-dev](https://huggingface.co/d0rj/t5gemma-2-1b-1b.dflash-dev) speculator.
+
+DSpark and DFlare checkpoints are served the same way:
+
+```bash
+vllm serve /path/to/t5gemma-2-1b-1b.dspark \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --served-model-name t5gemma-2-1b-1b-dspark \
+  --trust-remote-code \
+  --no-enable-chunked-prefill \
+  --max-model-len 512 \
+  --max-num-seqs 1
+
+vllm serve /path/to/t5gemma-2-1b-1b.dflare \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --served-model-name t5gemma-2-1b-1b-dflare \
+  --trust-remote-code \
+  --no-enable-chunked-prefill \
+  --max-model-len 512 \
+  --max-num-seqs 1
+```
+
+Internally the plugin maps `dspark` and `dflare` Speculators configs to vLLM's
+DFlash scheduler, then dispatches to DSpark/DFlare-specific draft model shims.
+DSpark uses a sequential Markov-bias sampling loop over the block positions;
+DFlare uses per-draft-layer target-state fusion before context KV precompute.
 
 ## Quick request
 
@@ -151,3 +184,5 @@ Mean acceptance length including the bonus token is:
   production use.
 - The package intentionally vendors only the code required to register and serve
   the T5Gemma 2 generation architecture. It does not include training code.
+- DSpark/DFlare serving is implemented for the current single-GPU vLLM setup.
+  Tensor parallel and pipeline parallel serving need separate validation.
