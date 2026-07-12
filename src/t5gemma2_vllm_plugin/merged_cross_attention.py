@@ -2,11 +2,9 @@
 """Merged self+cross attention for T5Gemma-style decoders.
 
 This module re-implements the HF-exact attention used by the vllm-factory
-reference decoder: one softmax over the concatenation of causal decoder keys
-and bidirectional encoder keys.  The vLLM paged self-attention block table is
-not a reliable source for reconstructing the full decoder history in this
-encoder-decoder path, so the layer keeps its own compact per-request decoder KV
-history while still updating vLLM's KV cache for the engine.
+reference decoder: one softmax over causal decoder keys and bidirectional
+encoder keys. The fast path reads both sources directly from vLLM paged KV
+caches, preserving CUDA Graph capture for dynamic request batches.
 """
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ from vllm.v1.attention.backend import AttentionType
 
 from .kernels.flash_t5gemma2_attention import (
     flash_t5gemma2_attention,
-    flash_t5gemma2_cached_single_attention,
+    flash_t5gemma2_paged_merged_attention,
 )
 
 
@@ -98,9 +96,6 @@ class MergedCrossAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         logits_soft_cap: float | None = None,
         sliding_window: int | None = None,
-        max_model_len: int,
-        max_num_seqs: int,
-        dtype: torch.dtype,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -114,13 +109,10 @@ class MergedCrossAttention(nn.Module):
         self.scale = scale
         self.logits_soft_cap = logits_soft_cap or 0.0
         self.sliding_window = sliding_window or 0
-        self.max_model_len = max_model_len
-        self.max_num_seqs = max_num_seqs
-        self.graph_cache_enabled = max_num_seqs == 1
 
-        # Decoder self-attention layer.  Its KV cache is updated and then read
-        # back so that we can concatenate self and cross keys for the merged
-        # attention kernel.
+        # These layers own vLLM paged KV caches and scheduling metadata. Their
+        # standard attention forwards are not called; the merged Triton kernel
+        # reads both caches in one online-softmax pass.
         self.self_attn = Attention(
             num_heads,
             head_size,
@@ -133,9 +125,6 @@ class MergedCrossAttention(nn.Module):
             prefix=f"{prefix}.self_cache",
             attn_type=AttentionType.DECODER,
         )
-        # Cross-attention layer is only used to obtain vLLM's encoder-decoder
-        # scheduling metadata (sequence lengths, etc.).  Its forward is never
-        # called because the encoder KV is passed explicitly.
         self.cross_attn = CrossAttention(
             num_heads,
             head_size,
@@ -148,32 +137,6 @@ class MergedCrossAttention(nn.Module):
         )
         self._self_key_cache: list[torch.Tensor] = []
         self._self_value_cache: list[torch.Tensor] = []
-        cache_shape = (max_model_len, num_kv_heads, head_size)
-        self.register_buffer(
-            "_single_self_key_cache",
-            torch.zeros(cache_shape, dtype=dtype),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_single_self_value_cache",
-            torch.zeros(cache_shape, dtype=dtype),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_single_cross_key_cache",
-            torch.zeros(cache_shape, dtype=dtype),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_single_cross_value_cache",
-            torch.zeros(cache_shape, dtype=dtype),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_single_cross_len",
-            torch.zeros(1, dtype=torch.int32),
-            persistent=False,
-        )
 
     @staticmethod
     def _window_size_tuple(window: Any) -> tuple[int, int]:
@@ -196,8 +159,12 @@ class MergedCrossAttention(nn.Module):
         self_key = self_key.view(-1, self.num_kv_heads, self.head_size)
         self_value = self_value.view(-1, self.num_kv_heads, self.head_size)
 
-        self_meta, _, _, _ = get_attention_context(self.self_attn.layer_name)
-        cross_meta, _, _, _ = get_attention_context(self.cross_attn.layer_name)
+        self_meta, _, self_kv_cache, _ = get_attention_context(
+            self.self_attn.layer_name
+        )
+        cross_meta, _, cross_kv_cache, _ = get_attention_context(
+            self.cross_attn.layer_name
+        )
 
         if self_meta is None:
             # Profiling run: vLLM only needs the output shape.
@@ -208,47 +175,47 @@ class MergedCrossAttention(nn.Module):
         self_key = self_key[:num_tokens]
         self_value = self_value[:num_tokens]
 
-        # Keep vLLM's engine-side KV cache current, but do not read the decoder
-        # history back from the paged block table.  For this encoder-decoder
-        # model, the table can expose only the current block during decode.
+        # Populate the paged decoder cache before the merged kernel reads it.
         unified_kv_cache_update(self_key, self_value, self.self_attn.layer_name)
 
-        if self.graph_cache_enabled:
+        if cross_key is not None and cross_value is not None:
+            cross_key = cross_key.view(-1, self.num_kv_heads, self.head_size)
+            cross_value = cross_value.view(-1, self.num_kv_heads, self.head_size)
+            unified_kv_cache_update(
+                cross_key,
+                cross_value,
+                self.cross_attn.layer_name,
+            )
+
+        if cross_meta is not None and self_kv_cache.numel() and cross_kv_cache.numel():
             if positions is None:
-                raise ValueError("positions are required for graph-safe merged attention")
+                raise ValueError("positions are required for paged merged attention")
+            self_key_cache, self_value_cache = self_kv_cache.unbind(1)
+            cross_key_cache, cross_value_cache = cross_kv_cache.unbind(1)
             token_positions = positions[:num_tokens].to(
                 device=query.device, dtype=torch.long
             )
-            self._single_self_key_cache.index_copy_(
-                0, token_positions, self_key
-            )
-            self._single_self_value_cache.index_copy_(
-                0, token_positions, self_value
-            )
-            if cross_key is not None and cross_value is not None:
-                cross_key = cross_key.view(-1, self.num_kv_heads, self.head_size)
-                cross_value = cross_value.view(
-                    -1, self.num_kv_heads, self.head_size
-                )
-                cross_tokens = cross_key.shape[0]
-                self._single_cross_key_cache[:cross_tokens].copy_(cross_key)
-                self._single_cross_value_cache[:cross_tokens].copy_(cross_value)
-                self._single_cross_len.fill_(cross_tokens)
-
-            output = flash_t5gemma2_cached_single_attention(
+            output = flash_t5gemma2_paged_merged_attention(
                 query,
-                self._single_self_key_cache,
-                self._single_self_value_cache,
-                self._single_cross_key_cache,
-                self._single_cross_value_cache,
+                self_key_cache,
+                self_value_cache,
+                cross_key_cache,
+                cross_value_cache,
                 token_positions,
-                self._single_cross_len,
+                self_meta.query_start_loc,
+                self_meta.seq_lens,
+                cross_meta.seq_lens,
+                self_meta.block_table,
+                cross_meta.block_table,
+                max_query_len=max(int(self_meta.max_query_len), 1),
                 softcap=self.logits_soft_cap,
                 sliding_window=self.sliding_window,
                 sm_scale=self.scale,
             )
             return output.reshape(num_tokens, self.num_heads * self.head_size)
 
+        # Legacy eager fallback for environments that do not bind both paged
+        # caches into the forward context.
         query_start_loc = self_meta.query_start_loc
         query_chunks = _split_flat_tokens(query, query_start_loc)
         key_chunks = _split_flat_tokens(self_key, query_start_loc)

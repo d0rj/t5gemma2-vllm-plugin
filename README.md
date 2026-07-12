@@ -137,13 +137,11 @@ DFlare uses per-draft-layer target-state fusion before context KV precompute.
 ## CUDA Graph support
 
 Raw T5Gemma 2 and all three DFlash-family runtimes support vLLM CUDA Graph
-capture when `--max-num-seqs 1`. The merged decoder attention uses persistent
-self/cross-KV buffers, keeps sequence metadata on GPU, and projects encoder K/V
-only during prefill. Do not pass `--enforce-eager` for this setup.
-
-For scheduler batches larger than one, the adapter currently falls back to the
-dynamic eager attention path. Start those servers with `--enforce-eager` until
-the persistent-cache implementation is generalized to multiple request slots.
+capture for actual batches from 1 through `--max-num-seqs`. The merged decoder
+kernel reads self-KV and cross-KV directly from vLLM's paged caches using GPU
+block tables and sequence lengths, so request reordering and cache-slot reuse do
+not require host synchronization. Encoder K/V is projected and cached only
+during prefill. Do not pass `--enforce-eager` for this setup.
 
 To override the checkpoint's default speculative-token count, serve the verifier
 and provide the draft checkpoint explicitly:
@@ -207,5 +205,6 @@ Mean acceptance length including the bonus token is:
   the T5Gemma 2 generation architecture. It does not include training code.
 - DSpark/DFlare serving is implemented for the current single-GPU vLLM setup.
   Tensor parallel and pipeline parallel serving need separate validation.
-- CUDA Graph serving currently requires `--max-num-seqs 1`; use
-  `--enforce-eager` for larger scheduler batches.
+- CUDA Graph serving has been validated with batch sizes 1, 2, 3, and 4. Larger
+  values are supported by the same paged-cache path but should be sized to the
+  available KV-cache memory and validated for the target workload.

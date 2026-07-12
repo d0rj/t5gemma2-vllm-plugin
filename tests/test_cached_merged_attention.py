@@ -6,6 +6,7 @@ import torch
 from t5gemma2_vllm_plugin.kernels.flash_t5gemma2_attention import (
     flash_t5gemma2_attention,
     flash_t5gemma2_cached_single_attention,
+    flash_t5gemma2_paged_merged_attention,
 )
 
 
@@ -74,3 +75,128 @@ def test_cached_single_attention_matches_padded_reference(
     )
 
     torch.testing.assert_close(actual, reference, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_paged_attention_matches_variable_length_batch() -> None:
+    torch.manual_seed(1)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_query_heads = 4
+    num_kv_heads = 1
+    head_dim = 256
+    page_size = 16
+    self_lengths = [20, 7, 18]
+    cross_lengths = [18, 5, 17]
+    query_lengths = [3, 1, 2]
+    num_seqs = len(self_lengths)
+
+    query_parts = [
+        torch.randn(
+            length,
+            num_query_heads,
+            head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        for length in query_lengths
+    ]
+    position_parts = [
+        torch.arange(self_len - query_len, self_len, device=device)
+        for self_len, query_len in zip(self_lengths, query_lengths, strict=True)
+    ]
+    query = torch.cat(query_parts)
+    positions = torch.cat(position_parts)
+    query_start_loc = torch.tensor(
+        [0, 3, 4, 6], device=device, dtype=torch.int32
+    )
+
+    num_pages = 16
+    cache_shape = (num_pages, page_size, num_kv_heads, head_dim)
+    self_key_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
+    self_value_cache = torch.zeros_like(self_key_cache)
+    cross_key_cache = torch.zeros_like(self_key_cache)
+    cross_value_cache = torch.zeros_like(self_key_cache)
+    self_block_table = torch.full(
+        (num_seqs, 4), -1, device=device, dtype=torch.int32
+    )
+    cross_block_table = torch.full_like(self_block_table, -1)
+    references = []
+    scale = head_dim**-0.5
+
+    for seq_idx in range(num_seqs):
+        self_key = torch.randn(
+            self_lengths[seq_idx],
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        self_value = torch.randn_like(self_key)
+        cross_key = torch.randn(
+            cross_lengths[seq_idx],
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        cross_value = torch.randn_like(cross_key)
+
+        for logical_page, start in enumerate(
+            range(0, self_lengths[seq_idx], page_size)
+        ):
+            physical_page = seq_idx * 2 + logical_page
+            self_block_table[seq_idx, logical_page] = physical_page
+            count = min(page_size, self_lengths[seq_idx] - start)
+            self_key_cache[physical_page, :count] = self_key[start : start + count]
+            self_value_cache[physical_page, :count] = self_value[
+                start : start + count
+            ]
+
+        for logical_page, start in enumerate(
+            range(0, cross_lengths[seq_idx], page_size)
+        ):
+            physical_page = 8 + seq_idx * 2 + logical_page
+            cross_block_table[seq_idx, logical_page] = physical_page
+            count = min(page_size, cross_lengths[seq_idx] - start)
+            cross_key_cache[physical_page, :count] = cross_key[start : start + count]
+            cross_value_cache[physical_page, :count] = cross_value[
+                start : start + count
+            ]
+
+        reference = flash_t5gemma2_attention(
+            query_parts[seq_idx].unsqueeze(0).transpose(1, 2),
+            torch.cat([self_key, cross_key]).unsqueeze(0).transpose(1, 2),
+            torch.cat([self_value, cross_value]).unsqueeze(0).transpose(1, 2),
+            key_mask=torch.ones(
+                1,
+                self_lengths[seq_idx] + cross_lengths[seq_idx],
+                device=device,
+                dtype=torch.int32,
+            ),
+            q_start_pos=position_parts[seq_idx][:1].to(torch.int32),
+            is_causal=True,
+            self_len=self_lengths[seq_idx],
+            sm_scale=scale,
+        ).transpose(1, 2).squeeze(0)
+        references.append(reference)
+
+    actual = flash_t5gemma2_paged_merged_attention(
+        query,
+        self_key_cache,
+        self_value_cache,
+        cross_key_cache,
+        cross_value_cache,
+        positions,
+        query_start_loc,
+        torch.tensor(self_lengths, device=device, dtype=torch.int32),
+        torch.tensor(cross_lengths, device=device, dtype=torch.int32),
+        self_block_table,
+        cross_block_table,
+        max_query_len=max(query_lengths),
+        sm_scale=scale,
+    )
+
+    torch.testing.assert_close(
+        actual, torch.cat(references), atol=3e-2, rtol=3e-2
+    )
