@@ -95,6 +95,9 @@ class T5Gemma2VllmMergedAttention(nn.Module):
             quant_config=quant,
             logits_soft_cap=config.attn_logit_softcapping,
             sliding_window=window,
+            max_model_len=vllm_config.model_config.max_model_len,
+            max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+            dtype=vllm_config.model_config.dtype,
             prefix=f"{prefix}.merged_attn",
         )
 
@@ -278,6 +281,9 @@ class T5Gemma2VllmForConditionalGeneration(
             soft_cap=decoder.final_logit_softcapping,
         )
         self._encoder_outputs_cache: torch.Tensor | None = None
+        self._single_request_merged_cache = (
+            vllm_config.scheduler_config.max_num_seqs == 1
+        )
 
     def get_language_model(self) -> nn.Module:
         # Eagle/DFlash expects get_language_model().model to be an
@@ -319,7 +325,7 @@ class T5Gemma2VllmForConditionalGeneration(
             encoder_outputs = torch.cat(encoder_outputs, dim=0)
         if encoder_outputs is not None:
             self._encoder_outputs_cache = encoder_outputs
-        else:
+        elif not self._single_request_merged_cache:
             encoder_outputs = self._encoder_outputs_cache
         return self.model(input_ids, positions, inputs_embeds, encoder_outputs)
 

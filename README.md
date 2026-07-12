@@ -134,6 +134,27 @@ DFlash scheduler, then dispatches to DSpark/DFlare-specific draft model shims.
 DSpark uses a sequential Markov-bias sampling loop over the block positions;
 DFlare uses per-draft-layer target-state fusion before context KV precompute.
 
+## CUDA Graph support
+
+Raw T5Gemma 2 and all three DFlash-family runtimes support vLLM CUDA Graph
+capture when `--max-num-seqs 1`. The merged decoder attention uses persistent
+self/cross-KV buffers, keeps sequence metadata on GPU, and projects encoder K/V
+only during prefill. Do not pass `--enforce-eager` for this setup.
+
+For scheduler batches larger than one, the adapter currently falls back to the
+dynamic eager attention path. Start those servers with `--enforce-eager` until
+the persistent-cache implementation is generalized to multiple request slots.
+
+To override the checkpoint's default speculative-token count, serve the verifier
+and provide the draft checkpoint explicitly:
+
+```bash
+vllm serve google/t5gemma-2-1b-1b \
+  --max-num-seqs 1 \
+  --no-enable-chunked-prefill \
+  --speculative-config '{"model":"/path/to/checkpoint","method":"dflash","num_speculative_tokens":3}'
+```
+
 ## Quick request
 
 ```bash
@@ -186,3 +207,5 @@ Mean acceptance length including the bonus token is:
   the T5Gemma 2 generation architecture. It does not include training code.
 - DSpark/DFlare serving is implemented for the current single-GPU vLLM setup.
   Tensor parallel and pipeline parallel serving need separate validation.
+- CUDA Graph serving currently requires `--max-num-seqs 1`; use
+  `--enforce-eager` for larger scheduler batches.

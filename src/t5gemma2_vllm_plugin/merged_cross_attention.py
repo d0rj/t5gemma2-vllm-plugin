@@ -25,7 +25,10 @@ from vllm.model_executor.layers.attention.cross_attention import CrossAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.v1.attention.backend import AttentionType
 
-from .kernels.flash_t5gemma2_attention import flash_t5gemma2_attention
+from .kernels.flash_t5gemma2_attention import (
+    flash_t5gemma2_attention,
+    flash_t5gemma2_cached_single_attention,
+)
 
 
 def _split_and_pad_cross_kv(
@@ -95,6 +98,9 @@ class MergedCrossAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         logits_soft_cap: float | None = None,
         sliding_window: int | None = None,
+        max_model_len: int,
+        max_num_seqs: int,
+        dtype: torch.dtype,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -108,6 +114,9 @@ class MergedCrossAttention(nn.Module):
         self.scale = scale
         self.logits_soft_cap = logits_soft_cap or 0.0
         self.sliding_window = sliding_window or 0
+        self.max_model_len = max_model_len
+        self.max_num_seqs = max_num_seqs
+        self.graph_cache_enabled = max_num_seqs == 1
 
         # Decoder self-attention layer.  Its KV cache is updated and then read
         # back so that we can concatenate self and cross keys for the merged
@@ -139,6 +148,32 @@ class MergedCrossAttention(nn.Module):
         )
         self._self_key_cache: list[torch.Tensor] = []
         self._self_value_cache: list[torch.Tensor] = []
+        cache_shape = (max_model_len, num_kv_heads, head_size)
+        self.register_buffer(
+            "_single_self_key_cache",
+            torch.zeros(cache_shape, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_single_self_value_cache",
+            torch.zeros(cache_shape, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_single_cross_key_cache",
+            torch.zeros(cache_shape, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_single_cross_value_cache",
+            torch.zeros(cache_shape, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_single_cross_len",
+            torch.zeros(1, dtype=torch.int32),
+            persistent=False,
+        )
 
     @staticmethod
     def _window_size_tuple(window: Any) -> tuple[int, int]:
@@ -177,6 +212,42 @@ class MergedCrossAttention(nn.Module):
         # history back from the paged block table.  For this encoder-decoder
         # model, the table can expose only the current block during decode.
         unified_kv_cache_update(self_key, self_value, self.self_attn.layer_name)
+
+        if self.graph_cache_enabled:
+            if positions is None:
+                raise ValueError("positions are required for graph-safe merged attention")
+            token_positions = positions[:num_tokens].to(
+                device=query.device, dtype=torch.long
+            )
+            self._single_self_key_cache.index_copy_(
+                0, token_positions, self_key
+            )
+            self._single_self_value_cache.index_copy_(
+                0, token_positions, self_value
+            )
+            if cross_key is not None and cross_value is not None:
+                cross_key = cross_key.view(-1, self.num_kv_heads, self.head_size)
+                cross_value = cross_value.view(
+                    -1, self.num_kv_heads, self.head_size
+                )
+                cross_tokens = cross_key.shape[0]
+                self._single_cross_key_cache[:cross_tokens].copy_(cross_key)
+                self._single_cross_value_cache[:cross_tokens].copy_(cross_value)
+                self._single_cross_len.fill_(cross_tokens)
+
+            output = flash_t5gemma2_cached_single_attention(
+                query,
+                self._single_self_key_cache,
+                self._single_self_value_cache,
+                self._single_cross_key_cache,
+                self._single_cross_value_cache,
+                token_positions,
+                self._single_cross_len,
+                softcap=self.logits_soft_cap,
+                sliding_window=self.sliding_window,
+                sm_scale=self.scale,
+            )
+            return output.reshape(num_tokens, self.num_heads * self.head_size)
 
         query_start_loc = self_meta.query_start_loc
         query_chunks = _split_flat_tokens(query, query_start_loc)
