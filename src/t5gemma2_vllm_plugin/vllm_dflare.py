@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -152,7 +151,13 @@ class DFlareQwen3Model(DFlashQwen3Model):
 
 class DFlareDraftModel(DFlashQwen3ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # Do not call DFlashQwen3ForCausalLM.__init__ here. It constructs a
+        # complete DFlashQwen3Model before we replace it with the DFlare model,
+        # registering every attention layer twice under the same vLLM prefix.
+        nn.Module.__init__(self)
+        self.config = vllm_config.speculative_config.draft_model_config.hf_config
+        if getattr(self.config, "draft_vocab_size", None) is None:
+            self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
@@ -171,6 +176,14 @@ class DFlareDraftModel(DFlashQwen3ForCausalLM):
             self.config.draft_vocab_size,
             scale=logit_scale,
         )
+        target_vocab_size = vllm_config.model_config.get_vocab_size()
+        if self.config.draft_vocab_size != target_vocab_size:
+            self.draft_id_to_target_id = nn.Parameter(
+                torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
+                requires_grad=False,
+            )
+        else:
+            self.draft_id_to_target_id = None
 
     def embed_input_ids(
         self,
@@ -179,6 +192,12 @@ class DFlareDraftModel(DFlashQwen3ForCausalLM):
         is_multimodal: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # DFlare performs learned per-draft-layer fusion while populating its
+        # context K/V cache, so the concatenated verifier states must remain
+        # intact here.
+        return hidden_states
 
     def load_weights(self, weights):
         model_weights = []

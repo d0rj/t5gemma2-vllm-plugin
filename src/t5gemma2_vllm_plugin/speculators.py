@@ -144,8 +144,8 @@ def _build_dspark_model_class() -> type[nn.Module]:
     from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 
     class DSparkDraftModel(DFlashQwen3ForCausalLM):
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
+        def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
+            super().__init__(vllm_config=vllm_config, prefix=prefix)
             markov_rank = int(getattr(self.config, "markov_rank", 256) or 0)
             head_type = getattr(self.config, "markov_head_type", "vanilla")
             self.markov_head: _MarkovHead | None = None
@@ -169,13 +169,23 @@ def _build_dspark_model_class() -> type[nn.Module]:
             hidden_states: torch.Tensor,
             prev_token_ids: torch.Tensor,
         ) -> torch.Tensor:
-            logits = super().compute_logits(hidden_states)
+            logits = self.logits_processor(self.lm_head, hidden_states)
             if self.markov_head is not None:
                 logits = logits + self.markov_head.bias_for_step(
                     prev_token_ids=prev_token_ids,
                     hidden_states=hidden_states,
                 )
-            return logits
+            if self.draft_id_to_target_id is None:
+                return logits
+
+            base = torch.arange(self.config.draft_vocab_size, device=logits.device)
+            targets = base + self.draft_id_to_target_id
+            target_logits = logits.new_full(
+                (logits.shape[0], self.config.vocab_size),
+                float("-inf"),
+            )
+            target_logits[:, targets] = logits
+            return target_logits
 
         def load_weights(self, weights: Any):
             dspark_weights = []
@@ -221,11 +231,106 @@ def _patch_init_speculator() -> None:
     spec_decode_init.init_speculator = patched_init_speculator
 
 
+def _patch_current_dflash_proposer() -> None:
+    """Patch the vLLM >=0.23 DFlash proposer factory used by GPUModelRunner."""
+    import vllm.v1.worker.gpu_model_runner as gpu_model_runner
+    from vllm.v1.spec_decode.dflash import DFlashProposer
+
+    current = gpu_model_runner.DFlashProposer
+    if getattr(current, "_t5gemma2_dflash_family_patch", False):
+        return
+
+    class T5Gemma2DFlashFamilyProposer(DFlashProposer):
+        def __init__(self, vllm_config, device, runner=None):
+            super().__init__(vllm_config, device, runner)
+            hf_config = self.draft_model_config.hf_config
+            dflash_config = getattr(hf_config, "dflash_config", None) or {}
+            self._draft_arch = dflash_config.get("draft_arch", "llama")
+            self._dspark_prev_token_ids: torch.Tensor | None = None
+
+            if self._draft_arch == "dflare":
+                num_target_layers = len(dflash_config.get("target_layer_ids") or [])
+                target_hidden_size = (
+                    getattr(hf_config, "target_hidden_size", None) or self.hidden_size
+                )
+                self.hidden_size = num_target_layers * target_hidden_size
+                self.hidden_states = torch.zeros(
+                    self.max_num_tokens,
+                    self.hidden_size,
+                    dtype=self.dtype,
+                    device=device,
+                )
+
+        def set_inputs_first_pass(
+            self,
+            target_token_ids,
+            next_token_ids,
+            target_positions,
+            target_hidden_states,
+            token_indices_to_sample,
+            cad,
+            num_rejected_tokens_gpu,
+        ):
+            if self._draft_arch == "dspark":
+                self._dspark_prev_token_ids = next_token_ids
+            return super().set_inputs_first_pass(
+                target_token_ids,
+                next_token_ids,
+                target_positions,
+                target_hidden_states,
+                token_indices_to_sample,
+                cad,
+                num_rejected_tokens_gpu,
+            )
+
+        def _sample_draft_tokens(self, hidden_states, sampling_metadata):
+            if self._draft_arch != "dspark":
+                return super()._sample_draft_tokens(hidden_states, sampling_metadata)
+            if self._dspark_prev_token_ids is None:
+                raise RuntimeError("DSpark anchor token ids were not initialized")
+
+            batch_size = self._dspark_prev_token_ids.shape[0]
+            steps = self.num_speculative_tokens
+            hidden_steps = hidden_states.view(batch_size, steps, -1)
+            previous = self._dspark_prev_token_ids
+            sampled_steps = []
+            probability_steps = []
+            compute = getattr(self.model, "compute_logits_with_prev_tokens")
+            for step in range(steps):
+                logits = compute(hidden_steps[:, step], previous)
+                if (
+                    not self._enable_probabilistic_draft_probs
+                    or sampling_metadata.all_greedy
+                ):
+                    sampled = logits.argmax(dim=-1)
+                    probabilities = None
+                else:
+                    sampled, probabilities = self._sample_from_logits(
+                        logits, sampling_metadata
+                    )
+                sampled_steps.append(sampled)
+                if probabilities is not None:
+                    probability_steps.append(probabilities)
+                previous = sampled
+
+            tokens = torch.stack(sampled_steps, dim=1).reshape(-1)
+            if probability_steps:
+                probabilities = torch.stack(probability_steps, dim=1)
+                probabilities = probabilities.reshape(-1, probabilities.shape[-1])
+            else:
+                probabilities = None
+            return tokens, probabilities
+
+    T5Gemma2DFlashFamilyProposer._t5gemma2_dflash_family_patch = True
+    gpu_model_runner.DFlashProposer = T5Gemma2DFlashFamilyProposer
+
+
 def register_speculators() -> None:
     from vllm import ModelRegistry
 
     _register_speculators_config_shims()
     _patch_init_speculator()
+    _patch_current_dflash_proposer()
 
     try:
         ModelRegistry.register_model("DSparkDraftModel", _build_dspark_model_class())
