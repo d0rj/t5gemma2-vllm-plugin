@@ -167,17 +167,23 @@ def _flash_t5gemma2_fwd_kernel(
 
         qk = tl.where(valid, qk, float("-inf"))
 
+        # A sliding-window query can have no valid keys in an early KV block.
+        # Updating online softmax with an all--inf row produces -inf - -inf
+        # and permanently poisons the row with NaNs. Leave that row's running
+        # state unchanged until a block containing valid keys is reached.
+        row_has_valid = tl.sum(valid.to(tl.int32), axis=1) > 0
         m_ij = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
-        p = tl.exp(qk - m_new[:, None])
+        candidate_m = tl.maximum(m_i, m_ij)
+        safe_m = tl.where(row_has_valid, candidate_m, 0.0)
+        p = tl.where(valid, tl.exp(qk - safe_m[:, None]), 0.0)
         l_ij = tl.sum(p, axis=1)
 
-        alpha = tl.exp(m_i - m_new)
+        alpha = tl.where(row_has_valid, tl.exp(m_i - safe_m), 1.0)
         acc = acc * alpha[:, None]
         acc = acc + tl.dot(p, v.to(tl.float32), allow_tf32=False)
 
         l_i = l_i * alpha + l_ij
-        m_i = m_new
+        m_i = tl.where(row_has_valid, candidate_m, m_i)
 
     acc = acc / l_i[:, None]
 

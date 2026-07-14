@@ -19,6 +19,7 @@ from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseProcessingInfo,
     EncDecMultiModalProcessor,
+    ProcessorInputs,
     PromptReplacement,
     PromptUpdate,
 )
@@ -92,6 +93,33 @@ class T5Gemma2DummyInputsBuilder(BaseDummyInputsBuilder[T5Gemma2ProcessingInfo])
 
 class T5Gemma2Processor(EncDecMultiModalProcessor[T5Gemma2ProcessingInfo]):
     """Use the request prompt only as encoder input; decoder starts at BOS."""
+
+    def apply(self, inputs: ProcessorInputs, timing_ctx):
+        """Route a normal text prompt through the encoder modality.
+
+        vLLM's encoder-decoder fallback copies a plain token prompt into the
+        decoder when the processed encoder input is not multimodal. T5Gemma2
+        uses the text encoder for the request and must start the decoder from a
+        single start token, so turn ordinary prompts into our synthetic
+        ``text`` modality before delegating to the standard enc-dec processor.
+        """
+        if not inputs.mm_data_items.get_count("text", strict=False):
+            encoder_text = inputs.prompt
+            if not isinstance(encoder_text, str):
+                encoder_text = self.info.get_tokenizer().decode(
+                    encoder_text,
+                    skip_special_tokens=False,
+                )
+            inputs = ProcessorInputs(
+                prompt=[0],
+                mm_data_items=MultiModalDataItems(
+                    {"text": TextProcessorItems(encoder_text)}
+                ),
+                mm_uuid_items=None,
+                hf_processor_mm_kwargs=inputs.hf_processor_mm_kwargs,
+                tokenization_kwargs=inputs.tokenization_kwargs,
+            )
+        return super().apply(inputs, timing_ctx)
 
     def create_encoder_prompt(
         self,

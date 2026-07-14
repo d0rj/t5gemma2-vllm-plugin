@@ -76,6 +76,54 @@ def _split_flat_tokens(
     return [tensor[starts[i] : starts[i + 1]] for i in range(len(starts) - 1)]
 
 
+def _build_cross_slot_mapping(
+    positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    encoder_seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    block_size: int,
+    num_cross_tokens: int,
+) -> torch.Tensor:
+    """Map newly encoded tokens to their per-request cross-cache pages.
+
+    Cross-attention metadata in vLLM can expose the decoder slot mapping for
+    all but the first cross-attention layer. Build the mapping from the stable
+    encoder block table instead. Requests whose first scheduled decoder
+    position is zero are the requests carrying fresh encoder outputs.
+    """
+    mappings: list[torch.Tensor] = []
+    mapped_tokens = 0
+    num_sequences = query_start_loc.shape[0] - 1
+    for seq_idx in range(num_sequences):
+        query_start = int(query_start_loc[seq_idx].item())
+        query_end = int(query_start_loc[seq_idx + 1].item())
+        if query_start == query_end or int(positions[query_start].item()) != 0:
+            continue
+        seq_len = int(encoder_seq_lens[seq_idx].item())
+        if seq_len <= 0:
+            continue
+        logical_positions = torch.arange(
+            seq_len, device=block_table.device, dtype=torch.long
+        )
+        physical_blocks = block_table[
+            seq_idx, logical_positions // block_size
+        ].long()
+        mappings.append(
+            physical_blocks * block_size + logical_positions % block_size
+        )
+        mapped_tokens += seq_len
+
+    if mapped_tokens != num_cross_tokens:
+        raise RuntimeError(
+            "Cross-attention slot mapping size mismatch: "
+            f"mapped {mapped_tokens} encoder tokens, received {num_cross_tokens}"
+        )
+    if mappings:
+        return torch.cat(mappings)
+    return torch.empty(0, device=block_table.device, dtype=torch.long)
+
+
 class MergedCrossAttention(nn.Module):
     """One softmax over causal decoder KV and encoder KV.
 
@@ -162,7 +210,7 @@ class MergedCrossAttention(nn.Module):
         self_meta, _, self_kv_cache, _ = get_attention_context(
             self.self_attn.layer_name
         )
-        cross_meta, _, cross_kv_cache, _ = get_attention_context(
+        cross_meta, cross_attn_layer, cross_kv_cache, _ = get_attention_context(
             self.cross_attn.layer_name
         )
 
@@ -181,10 +229,24 @@ class MergedCrossAttention(nn.Module):
         if cross_key is not None and cross_value is not None:
             cross_key = cross_key.view(-1, self.num_kv_heads, self.head_size)
             cross_value = cross_value.view(-1, self.num_kv_heads, self.head_size)
-            unified_kv_cache_update(
+            if cross_meta is None:
+                raise RuntimeError("Cross-attention metadata is required for KV update")
+            if positions is None:
+                raise ValueError("positions are required for cross-cache update")
+            cross_slot_mapping = _build_cross_slot_mapping(
+                positions,
+                self_meta.query_start_loc,
+                cross_meta.seq_lens,
+                cross_meta.block_table,
+                block_size=int(cross_kv_cache.shape[2]),
+                num_cross_tokens=cross_key.shape[0],
+            )
+            cross_attn_layer.impl.do_kv_cache_update(
+                cross_attn_layer,
                 cross_key,
                 cross_value,
-                self.cross_attn.layer_name,
+                cross_kv_cache,
+                cross_slot_mapping,
             )
 
         if cross_meta is not None and self_kv_cache.numel() and cross_kv_cache.numel():

@@ -13,7 +13,7 @@ from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
 )
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import maybe_prefix, process_eagle_weight
 from vllm.multimodal.inputs import NestedTensors
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
@@ -211,13 +211,21 @@ class DFlareDraftModel(DFlashQwen3ForCausalLM):
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
                 direct_weights.append((name, loaded_weight))
+                process_eagle_weight(self, name)
                 continue
             if "lm_head" in name:
                 direct_weights.append((name, loaded_weight))
+                process_eagle_weight(self, name)
                 continue
             if "embed_tokens" in name:
                 includes_embed_tokens = True
             model_weights.append((name, loaded_weight))
+            # vLLM uses these flags after loading to decide whether the draft
+            # embedding/head may be replaced by the verifier's weights.  The
+            # stock DFlash loader calls process_eagle_weight for every mapped
+            # checkpoint key; DFlare must do the same even though its custom
+            # layer-wise target projections require a separate loader below.
+            process_eagle_weight(self, f"model.{name}")
 
         skip_substrs = []
         if not includes_draft_id_mapping:

@@ -22,12 +22,18 @@ def _copy_dflash_fields(
         pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
 
     aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
-    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
+    # The T5Gemma online extractor treats these as zero-based decoder layer
+    # indices and hooks layer ``i`` itself. EagleModelMixin numbers the input
+    # embedding as state 0 and the output of decoder layer ``i`` as state i+1.
+    # Request i+1 here so serving feeds the drafter the same layers as training.
+    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = [
+        i + 1 for i in aux_layer_ids
+    ]
     pre_trained_config["dflash_config"] = {
         "mask_token_id": config_dict["mask_token_id"],
-        # vLLM's DFlash adapter stores target layer ids one lower than the
-        # speculators config ids used by gpu_model_runner hidden-state capture.
-        "target_layer_ids": [i - 1 for i in aux_layer_ids],
+        # Upstream DFlash uses this list to size the fusion projection; retain
+        # the checkpoint's layer-index semantics for diagnostics and metadata.
+        "target_layer_ids": aux_layer_ids,
         "draft_arch": draft_arch,
     }
 
@@ -169,12 +175,9 @@ def _build_dspark_model_class() -> type[nn.Module]:
             hidden_states: torch.Tensor,
             prev_token_ids: torch.Tensor,
         ) -> torch.Tensor:
-            logits = self.logits_processor(self.lm_head, hidden_states)
-            if self.markov_head is not None:
-                logits = logits + self.markov_head.bias_for_step(
-                    prev_token_ids=prev_token_ids,
-                    hidden_states=hidden_states,
-                )
+            logits = self.compute_draft_logits_with_prev_tokens(
+                hidden_states, prev_token_ids
+            )
             if self.draft_id_to_target_id is None:
                 return logits
 
@@ -186,6 +189,19 @@ def _build_dspark_model_class() -> type[nn.Module]:
             )
             target_logits[:, targets] = logits
             return target_logits
+
+        def compute_draft_logits_with_prev_tokens(
+            self,
+            hidden_states: torch.Tensor,
+            prev_token_ids: torch.Tensor,
+        ) -> torch.Tensor:
+            logits = self.logits_processor(self.lm_head, hidden_states)
+            if self.markov_head is not None:
+                logits = logits + self.markov_head.bias_for_step(
+                    prev_token_ids=prev_token_ids,
+                    hidden_states=hidden_states,
+                )
+            return logits
 
         def load_weights(self, weights: Any):
             dspark_weights = []
@@ -241,8 +257,34 @@ def _patch_current_dflash_proposer() -> None:
         return
 
     class T5Gemma2DFlashFamilyProposer(DFlashProposer):
+        def _maybe_share_embeddings(self, target_language_model):
+            target_inner = getattr(target_language_model, "model", None)
+            target_embedding = (
+                getattr(target_inner, "embed_tokens", None)
+                if target_inner is not None
+                else None
+            )
+            if target_embedding is None and target_inner is not None:
+                target_embedding = getattr(target_inner, "embedding", None)
+            if _uses_scaled_embedding(target_embedding):
+                draft_embedding = getattr(self.model.model, "embed_tokens", None)
+                if draft_embedding is None:
+                    raise RuntimeError(
+                        "T5Gemma2 DFlash checkpoint has no draft embedding"
+                    )
+                _share_unscaled_embedding_weight(
+                    draft_embedding, target_embedding
+                )
+                return
+            return super()._maybe_share_embeddings(target_language_model)
+
         def __init__(self, vllm_config, device, runner=None):
             super().__init__(vllm_config, device, runner)
+            # The target exposes its text encoder through vLLM's multimodal
+            # cache, but the DFlash-family draft model consumes only decoder
+            # token IDs plus target auxiliary states. Asking the runner for
+            # encoder embeddings after prefill causes a cache miss on decode.
+            self.supports_mm_inputs = False
             hf_config = self.draft_model_config.hf_config
             dflash_config = getattr(hf_config, "dflash_config", None) or {}
             self._draft_arch = dflash_config.get("draft_arch", "llama")
@@ -284,7 +326,20 @@ def _patch_current_dflash_proposer() -> None:
             )
 
         def _sample_draft_tokens(self, hidden_states, sampling_metadata):
+            greedy = (
+                not self._enable_probabilistic_draft_probs
+                or sampling_metadata.all_greedy
+            )
             if self._draft_arch != "dspark":
+                if greedy:
+                    logits = self.model.logits_processor(
+                        self.model.lm_head, hidden_states
+                    )
+                    sampled = logits.argmax(dim=-1)
+                    mapping = getattr(self.model, "draft_id_to_target_id", None)
+                    if mapping is not None:
+                        sampled = sampled + mapping[sampled]
+                    return sampled, None
                 return super()._sample_draft_tokens(hidden_states, sampling_metadata)
             if self._dspark_prev_token_ids is None:
                 raise RuntimeError("DSpark anchor token ids were not initialized")
@@ -295,16 +350,23 @@ def _patch_current_dflash_proposer() -> None:
             previous = self._dspark_prev_token_ids
             sampled_steps = []
             probability_steps = []
-            compute = getattr(self.model, "compute_logits_with_prev_tokens")
+            compute_full = getattr(self.model, "compute_logits_with_prev_tokens")
+            compute_draft = getattr(
+                self.model, "compute_draft_logits_with_prev_tokens"
+            )
             for step in range(steps):
-                logits = compute(hidden_steps[:, step], previous)
-                if (
-                    not self._enable_probabilistic_draft_probs
-                    or sampling_metadata.all_greedy
-                ):
-                    sampled = logits.argmax(dim=-1)
+                if greedy:
+                    logits = compute_draft(hidden_steps[:, step], previous)
+                    sampled_draft = logits.argmax(dim=-1)
+                    mapping = getattr(self.model, "draft_id_to_target_id", None)
+                    sampled = (
+                        sampled_draft
+                        if mapping is None
+                        else sampled_draft + mapping[sampled_draft]
+                    )
                     probabilities = None
                 else:
+                    logits = compute_full(hidden_steps[:, step], previous)
                     sampled, probabilities = self._sample_from_logits(
                         logits, sampling_metadata
                     )
@@ -325,10 +387,69 @@ def _patch_current_dflash_proposer() -> None:
     gpu_model_runner.DFlashProposer = T5Gemma2DFlashFamilyProposer
 
 
+def _uses_scaled_embedding(module: nn.Module | None) -> bool:
+    if module is None:
+        return False
+    scale = getattr(module, "scalar_embed_scale", 1.0)
+    return float(scale) != 1.0
+
+
+def _share_unscaled_embedding_weight(
+    draft_embedding: nn.Module,
+    target_embedding: nn.Module,
+) -> None:
+    """Share only the Parameter, preserving the draft embedding forward."""
+    draft_embedding.weight = target_embedding.weight
+
+
+def _patch_scaled_embedding_sharing() -> None:
+    """Keep DFlash's raw embedding operation for scaled T5Gemma targets."""
+    import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
+    import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
+
+    original_should_share = dflash_utils._should_share
+    if getattr(original_should_share, "_t5gemma2_scaled_embedding_patch", False):
+        return
+    original_load = dflash_utils.load_dflash_model
+
+    def patched_should_share(eagle, flag, draft, target):
+        if flag == "has_own_embed_tokens" and _uses_scaled_embedding(target):
+            return False
+        return original_should_share(eagle, flag, draft, target)
+
+    def patched_load_dflash_model(target_model, vllm_config):
+        draft_model = original_load(target_model, vllm_config)
+        target_language_model = (
+            target_model.get_language_model()
+            if hasattr(target_model, "get_language_model")
+            else target_model
+        )
+        target_inner = target_language_model.model
+        target_embedding = getattr(target_inner, "embed_tokens", None) or getattr(
+            target_inner, "embedding", None
+        )
+        draft_embedding = getattr(draft_model.model, "embed_tokens", None)
+        if (
+            draft_embedding is not None
+            and target_embedding is not None
+            and _uses_scaled_embedding(target_embedding)
+        ):
+            _share_unscaled_embedding_weight(draft_embedding, target_embedding)
+        return draft_model
+
+    patched_should_share._t5gemma2_scaled_embedding_patch = True
+    patched_load_dflash_model._t5gemma2_scaled_embedding_patch = True
+    dflash_utils._should_share = patched_should_share
+    dflash_utils.load_dflash_model = patched_load_dflash_model
+    # DFlashSpeculator imports the function into its module namespace.
+    dflash_speculator.load_dflash_model = patched_load_dflash_model
+
+
 def register_speculators() -> None:
     from vllm import ModelRegistry
 
     _register_speculators_config_shims()
+    _patch_scaled_embedding_sharing()
     _patch_init_speculator()
     _patch_current_dflash_proposer()
 
