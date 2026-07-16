@@ -65,10 +65,16 @@ vllm serve google/t5gemma-2-1b-1b \
   --max-num-seqs 1
 ```
 
-## Serve a T5Gemma 2 DFlash checkpoint
+## Serve a T5Gemma 2 DFlash-family checkpoint
 
-The DFlash checkpoint must be in Speculators format and its `config.json` must
-contain:
+The checkpoint must be in Speculators format. The plugin registers T5Gemma 2
+plus these DFlash-family draft architectures:
+
+- `DFlashDraftModel`
+- `DSparkDraftModel`
+- `DFlareDraftModel`
+
+For DFlash, its `config.json` contains:
 
 ```json
 {
@@ -100,6 +106,52 @@ vLLM reads the Speculators config from the checkpoint, loads the verifier
 `google/t5gemma-2-1b-1b`, and enables DFlash speculative decoding.
 
 For example you can try [d0rj/t5gemma-2-1b-1b.dflash-dev](https://huggingface.co/d0rj/t5gemma-2-1b-1b.dflash-dev) speculator.
+
+DSpark and DFlare checkpoints are served the same way:
+
+```bash
+vllm serve /path/to/t5gemma-2-1b-1b.dspark \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --served-model-name t5gemma-2-1b-1b-dspark \
+  --trust-remote-code \
+  --no-enable-chunked-prefill \
+  --max-model-len 512 \
+  --max-num-seqs 1
+
+vllm serve /path/to/t5gemma-2-1b-1b.dflare \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --served-model-name t5gemma-2-1b-1b-dflare \
+  --trust-remote-code \
+  --no-enable-chunked-prefill \
+  --max-model-len 512 \
+  --max-num-seqs 1
+```
+
+Internally the plugin maps `dspark` and `dflare` Speculators configs to vLLM's
+DFlash scheduler, then dispatches to DSpark/DFlare-specific draft model shims.
+DSpark uses a sequential Markov-bias sampling loop over the block positions;
+DFlare uses per-draft-layer target-state fusion before context KV precompute.
+
+## CUDA Graph support
+
+Raw T5Gemma 2 and all three DFlash-family runtimes support vLLM CUDA Graph
+capture for actual batches from 1 through `--max-num-seqs`. The merged decoder
+kernel reads self-KV and cross-KV directly from vLLM's paged caches using GPU
+block tables and sequence lengths, so request reordering and cache-slot reuse do
+not require host synchronization. Encoder K/V is projected and cached only
+during prefill. Do not pass `--enforce-eager` for this setup.
+
+To override the checkpoint's default speculative-token count, serve the verifier
+and provide the draft checkpoint explicitly:
+
+```bash
+vllm serve google/t5gemma-2-1b-1b \
+  --max-num-seqs 1 \
+  --no-enable-chunked-prefill \
+  --speculative-config '{"model":"/path/to/checkpoint","method":"dflash","num_speculative_tokens":3}'
+```
 
 ## Quick request
 
@@ -151,3 +203,8 @@ Mean acceptance length including the bonus token is:
   production use.
 - The package intentionally vendors only the code required to register and serve
   the T5Gemma 2 generation architecture. It does not include training code.
+- DSpark/DFlare serving is implemented for the current single-GPU vLLM setup.
+  Tensor parallel and pipeline parallel serving need separate validation.
+- CUDA Graph serving has been validated with batch sizes 1, 2, 3, and 4. Larger
+  values are supported by the same paged-cache path but should be sized to the
+  available KV-cache memory and validated for the target workload.

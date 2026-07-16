@@ -167,17 +167,23 @@ def _flash_t5gemma2_fwd_kernel(
 
         qk = tl.where(valid, qk, float("-inf"))
 
+        # A sliding-window query can have no valid keys in an early KV block.
+        # Updating online softmax with an all--inf row produces -inf - -inf
+        # and permanently poisons the row with NaNs. Leave that row's running
+        # state unchanged until a block containing valid keys is reached.
+        row_has_valid = tl.sum(valid.to(tl.int32), axis=1) > 0
         m_ij = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
-        p = tl.exp(qk - m_new[:, None])
+        candidate_m = tl.maximum(m_i, m_ij)
+        safe_m = tl.where(row_has_valid, candidate_m, 0.0)
+        p = tl.where(valid, tl.exp(qk - safe_m[:, None]), 0.0)
         l_ij = tl.sum(p, axis=1)
 
-        alpha = tl.exp(m_i - m_new)
+        alpha = tl.where(row_has_valid, tl.exp(m_i - safe_m), 1.0)
         acc = acc * alpha[:, None]
         acc = acc + tl.dot(p, v.to(tl.float32), allow_tf32=False)
 
         l_i = l_i * alpha + l_ij
-        m_i = m_new
+        m_i = tl.where(row_has_valid, candidate_m, m_i)
 
     acc = acc / l_i[:, None]
 
@@ -264,6 +270,337 @@ def _flash_t5gemma2_fwd_kernel_autotuned(
         BLOCK_N,
         BLOCK_DMODEL,
     )
+
+
+@triton.jit
+def _flash_t5gemma2_cached_single_fwd_kernel(
+    Q,
+    Self_K,
+    Self_V,
+    Cross_K,
+    Cross_V,
+    Positions,
+    Cross_Len,
+    Out,
+    stride_qm,
+    stride_qh,
+    stride_qd,
+    stride_skn,
+    stride_skh,
+    stride_skd,
+    stride_svn,
+    stride_svh,
+    stride_svd,
+    stride_ckn,
+    stride_ckh,
+    stride_ckd,
+    stride_cvn,
+    stride_cvh,
+    stride_cvd,
+    stride_om,
+    stride_oh,
+    stride_od,
+    num_queries,
+    self_capacity,
+    cross_capacity,
+    softcap,
+    sliding_window,
+    sm_scale,
+    HAS_SOFTCAP: tl.constexpr,
+    HAS_SLIDING_WINDOW: tl.constexpr,
+    GQA_GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+):
+    """Graph-safe merged attention for one active request.
+
+    Decoder and encoder K/V use separate persistent buffers. Sequence lengths
+    and decoder positions remain on GPU, so graph replay has no host reads.
+    """
+    pid_m = tl.program_id(0)
+    pid_hq = tl.program_id(1)
+    pid_hkv = pid_hq // GQA_GROUP_SIZE
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_n = tl.arange(0, BLOCK_N)
+    q_valid = offs_m < num_queries
+
+    q_ptrs = (
+        Q
+        + offs_m[:, None] * stride_qm
+        + pid_hq * stride_qh
+        + offs_d[None, :] * stride_qd
+    )
+    q = tl.load(q_ptrs, mask=q_valid[:, None], other=0.0)
+    q_pos = tl.load(Positions + offs_m, mask=q_valid, other=0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+
+    max_q_pos = tl.max(tl.where(q_valid, q_pos, 0), axis=0)
+    self_end = tl.minimum(max_q_pos + 1, self_capacity)
+    num_self_blocks = tl.cdiv(self_end, BLOCK_N)
+    for block_idx in range(num_self_blocks):
+        key_pos = block_idx * BLOCK_N + offs_n
+        key_valid = key_pos < self_end
+        k_ptrs = (
+            Self_K
+            + key_pos[None, :] * stride_skn
+            + pid_hkv * stride_skh
+            + offs_d[:, None] * stride_skd
+        )
+        v_ptrs = (
+            Self_V
+            + key_pos[:, None] * stride_svn
+            + pid_hkv * stride_svh
+            + offs_d[None, :] * stride_svd
+        )
+        k = tl.load(k_ptrs, mask=key_valid[None, :], other=0.0)
+        v = tl.load(v_ptrs, mask=key_valid[:, None], other=0.0)
+        qk = tl.dot(q.to(tl.float32), k.to(tl.float32), allow_tf32=False)
+        qk *= sm_scale
+        if HAS_SOFTCAP:
+            qk = tl.extra.cuda.libdevice.tanh(qk / softcap) * softcap
+
+        valid = q_valid[:, None] & key_valid[None, :]
+        valid &= key_pos[None, :] <= q_pos[:, None]
+        if HAS_SLIDING_WINDOW:
+            valid &= (q_pos[:, None] - key_pos[None, :]) < sliding_window
+        qk = tl.where(valid, qk, float("-inf"))
+
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+        acc = acc * alpha[:, None]
+        acc += tl.dot(p, v.to(tl.float32), allow_tf32=False)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    cross_len = tl.minimum(tl.load(Cross_Len), cross_capacity)
+    num_cross_blocks = tl.cdiv(cross_len, BLOCK_N)
+    for block_idx in range(num_cross_blocks):
+        key_pos = block_idx * BLOCK_N + offs_n
+        key_valid = key_pos < cross_len
+        k_ptrs = (
+            Cross_K
+            + key_pos[None, :] * stride_ckn
+            + pid_hkv * stride_ckh
+            + offs_d[:, None] * stride_ckd
+        )
+        v_ptrs = (
+            Cross_V
+            + key_pos[:, None] * stride_cvn
+            + pid_hkv * stride_cvh
+            + offs_d[None, :] * stride_cvd
+        )
+        k = tl.load(k_ptrs, mask=key_valid[None, :], other=0.0)
+        v = tl.load(v_ptrs, mask=key_valid[:, None], other=0.0)
+        qk = tl.dot(q.to(tl.float32), k.to(tl.float32), allow_tf32=False)
+        qk *= sm_scale
+        if HAS_SOFTCAP:
+            qk = tl.extra.cuda.libdevice.tanh(qk / softcap) * softcap
+        qk = tl.where(q_valid[:, None] & key_valid[None, :], qk, float("-inf"))
+
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+        acc = acc * alpha[:, None]
+        acc += tl.dot(p, v.to(tl.float32), allow_tf32=False)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    acc /= l_i[:, None]
+    out_ptrs = (
+        Out
+        + offs_m[:, None] * stride_om
+        + pid_hq * stride_oh
+        + offs_d[None, :] * stride_od
+    )
+    tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=q_valid[:, None])
+
+
+@triton.jit
+def _flash_t5gemma2_paged_merged_fwd_kernel(
+    Q,
+    Self_K,
+    Self_V,
+    Cross_K,
+    Cross_V,
+    Positions,
+    Query_Start_Loc,
+    Self_Seq_Lens,
+    Cross_Seq_Lens,
+    Self_Block_Table,
+    Cross_Block_Table,
+    Out,
+    stride_qm,
+    stride_qh,
+    stride_qd,
+    stride_skb,
+    stride_skt,
+    stride_skh,
+    stride_skd,
+    stride_svb,
+    stride_svt,
+    stride_svh,
+    stride_svd,
+    stride_ckb,
+    stride_ckt,
+    stride_ckh,
+    stride_ckd,
+    stride_cvb,
+    stride_cvt,
+    stride_cvh,
+    stride_cvd,
+    stride_sbt,
+    stride_cbt,
+    stride_om,
+    stride_oh,
+    stride_od,
+    max_query_len,
+    softcap,
+    sliding_window,
+    sm_scale,
+    HAS_SOFTCAP: tl.constexpr,
+    HAS_SLIDING_WINDOW: tl.constexpr,
+    GQA_GROUP_SIZE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+):
+    """Merged self+cross attention over two vLLM paged KV caches."""
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_hq = tl.program_id(2)
+    pid_hkv = pid_hq // GQA_GROUP_SIZE
+
+    query_start = tl.load(Query_Start_Loc + pid_b)
+    query_end = tl.load(Query_Start_Loc + pid_b + 1)
+    query_len = query_end - query_start
+    offs_m_local = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m = query_start + offs_m_local
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_n = tl.arange(0, BLOCK_N)
+    q_valid = offs_m_local < query_len
+
+    q_ptrs = (
+        Q
+        + offs_m[:, None] * stride_qm
+        + pid_hq * stride_qh
+        + offs_d[None, :] * stride_qd
+    )
+    q = tl.load(q_ptrs, mask=q_valid[:, None], other=0.0)
+    q_pos = tl.load(Positions + offs_m, mask=q_valid, other=0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+
+    self_len = tl.load(Self_Seq_Lens + pid_b)
+    num_self_blocks = tl.cdiv(self_len, BLOCK_N)
+    for block_idx in range(num_self_blocks):
+        key_pos = block_idx * BLOCK_N + offs_n
+        key_valid = key_pos < self_len
+        logical_page = key_pos // PAGE_SIZE
+        page_offset = key_pos % PAGE_SIZE
+        physical_page = tl.load(
+            Self_Block_Table + pid_b * stride_sbt + logical_page,
+            mask=key_valid,
+            other=0,
+        )
+        k_ptrs = (
+            Self_K
+            + physical_page[None, :] * stride_skb
+            + page_offset[None, :] * stride_skt
+            + pid_hkv * stride_skh
+            + offs_d[:, None] * stride_skd
+        )
+        v_ptrs = (
+            Self_V
+            + physical_page[:, None] * stride_svb
+            + page_offset[:, None] * stride_svt
+            + pid_hkv * stride_svh
+            + offs_d[None, :] * stride_svd
+        )
+        k = tl.load(k_ptrs, mask=key_valid[None, :], other=0.0)
+        v = tl.load(v_ptrs, mask=key_valid[:, None], other=0.0)
+        qk = tl.dot(q.to(tl.float32), k.to(tl.float32), allow_tf32=False)
+        qk *= sm_scale
+        if HAS_SOFTCAP:
+            qk = tl.extra.cuda.libdevice.tanh(qk / softcap) * softcap
+
+        valid = q_valid[:, None] & key_valid[None, :]
+        valid &= key_pos[None, :] <= q_pos[:, None]
+        if HAS_SLIDING_WINDOW:
+            valid &= (q_pos[:, None] - key_pos[None, :]) < sliding_window
+        qk = tl.where(valid, qk, float("-inf"))
+
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+        acc = acc * alpha[:, None]
+        acc += tl.dot(p, v.to(tl.float32), allow_tf32=False)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    cross_len = tl.load(Cross_Seq_Lens + pid_b)
+    num_cross_blocks = tl.cdiv(cross_len, BLOCK_N)
+    for block_idx in range(num_cross_blocks):
+        key_pos = block_idx * BLOCK_N + offs_n
+        key_valid = key_pos < cross_len
+        logical_page = key_pos // PAGE_SIZE
+        page_offset = key_pos % PAGE_SIZE
+        physical_page = tl.load(
+            Cross_Block_Table + pid_b * stride_cbt + logical_page,
+            mask=key_valid,
+            other=0,
+        )
+        k_ptrs = (
+            Cross_K
+            + physical_page[None, :] * stride_ckb
+            + page_offset[None, :] * stride_ckt
+            + pid_hkv * stride_ckh
+            + offs_d[:, None] * stride_ckd
+        )
+        v_ptrs = (
+            Cross_V
+            + physical_page[:, None] * stride_cvb
+            + page_offset[:, None] * stride_cvt
+            + pid_hkv * stride_cvh
+            + offs_d[None, :] * stride_cvd
+        )
+        k = tl.load(k_ptrs, mask=key_valid[None, :], other=0.0)
+        v = tl.load(v_ptrs, mask=key_valid[:, None], other=0.0)
+        qk = tl.dot(q.to(tl.float32), k.to(tl.float32), allow_tf32=False)
+        qk *= sm_scale
+        if HAS_SOFTCAP:
+            qk = tl.extra.cuda.libdevice.tanh(qk / softcap) * softcap
+        qk = tl.where(q_valid[:, None] & key_valid[None, :], qk, float("-inf"))
+
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+        acc = acc * alpha[:, None]
+        acc += tl.dot(p, v.to(tl.float32), allow_tf32=False)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    acc /= l_i[:, None]
+    out_ptrs = (
+        Out
+        + offs_m[:, None] * stride_om
+        + pid_hq * stride_oh
+        + offs_d[None, :] * stride_od
+    )
+    tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=q_valid[:, None])
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +716,154 @@ def flash_t5gemma2_attention(
         BLOCK_DMODEL=head_dim,
     )
 
+    return out
+
+
+def flash_t5gemma2_cached_single_attention(
+    q: torch.Tensor,
+    self_k: torch.Tensor,
+    self_v: torch.Tensor,
+    cross_k: torch.Tensor,
+    cross_v: torch.Tensor,
+    positions: torch.Tensor,
+    cross_len: torch.Tensor,
+    *,
+    softcap: float = 0.0,
+    sliding_window: int = 0,
+    sm_scale: float = 1.0,
+) -> torch.Tensor:
+    """Merged self+cross attention over persistent caches for batch size one."""
+    num_queries, num_heads_q, head_dim = q.shape
+    _, num_heads_kv, _ = self_k.shape
+    if num_heads_q % num_heads_kv != 0:
+        raise ValueError("num_heads_q must be divisible by num_heads_kv")
+    out = torch.empty_like(q)
+    grid = (triton.cdiv(num_queries, 16), num_heads_q)
+    _flash_t5gemma2_cached_single_fwd_kernel[grid](
+        q,
+        self_k,
+        self_v,
+        cross_k,
+        cross_v,
+        positions,
+        cross_len,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        self_k.stride(0),
+        self_k.stride(1),
+        self_k.stride(2),
+        self_v.stride(0),
+        self_v.stride(1),
+        self_v.stride(2),
+        cross_k.stride(0),
+        cross_k.stride(1),
+        cross_k.stride(2),
+        cross_v.stride(0),
+        cross_v.stride(1),
+        cross_v.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        num_queries,
+        self_k.shape[0],
+        cross_k.shape[0],
+        softcap,
+        sliding_window,
+        sm_scale,
+        HAS_SOFTCAP=softcap != 0.0,
+        HAS_SLIDING_WINDOW=sliding_window > 0,
+        GQA_GROUP_SIZE=num_heads_q // num_heads_kv,
+        BLOCK_M=16,
+        BLOCK_N=32,
+        BLOCK_DMODEL=head_dim,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
+def flash_t5gemma2_paged_merged_attention(
+    q: torch.Tensor,
+    self_k: torch.Tensor,
+    self_v: torch.Tensor,
+    cross_k: torch.Tensor,
+    cross_v: torch.Tensor,
+    positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    self_seq_lens: torch.Tensor,
+    cross_seq_lens: torch.Tensor,
+    self_block_table: torch.Tensor,
+    cross_block_table: torch.Tensor,
+    *,
+    max_query_len: int,
+    softcap: float = 0.0,
+    sliding_window: int = 0,
+    sm_scale: float = 1.0,
+) -> torch.Tensor:
+    """Merged attention for a packed batch backed by vLLM paged caches."""
+    num_queries, num_heads_q, head_dim = q.shape
+    _, page_size, num_heads_kv, _ = self_k.shape
+    if num_heads_q % num_heads_kv != 0:
+        raise ValueError("num_heads_q must be divisible by num_heads_kv")
+    if cross_k.shape[1] != page_size:
+        raise ValueError("self and cross KV caches must use the same page size")
+
+    out = torch.empty_like(q)
+    num_seqs = query_start_loc.shape[0] - 1
+    grid = (triton.cdiv(max_query_len, 16), num_seqs, num_heads_q)
+    _flash_t5gemma2_paged_merged_fwd_kernel[grid](
+        q,
+        self_k,
+        self_v,
+        cross_k,
+        cross_v,
+        positions,
+        query_start_loc,
+        self_seq_lens,
+        cross_seq_lens,
+        self_block_table,
+        cross_block_table,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        self_k.stride(0),
+        self_k.stride(1),
+        self_k.stride(2),
+        self_k.stride(3),
+        self_v.stride(0),
+        self_v.stride(1),
+        self_v.stride(2),
+        self_v.stride(3),
+        cross_k.stride(0),
+        cross_k.stride(1),
+        cross_k.stride(2),
+        cross_k.stride(3),
+        cross_v.stride(0),
+        cross_v.stride(1),
+        cross_v.stride(2),
+        cross_v.stride(3),
+        self_block_table.stride(0),
+        cross_block_table.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        max_query_len,
+        softcap,
+        sliding_window,
+        sm_scale,
+        HAS_SOFTCAP=softcap != 0.0,
+        HAS_SLIDING_WINDOW=sliding_window > 0,
+        GQA_GROUP_SIZE=num_heads_q // num_heads_kv,
+        PAGE_SIZE=page_size,
+        BLOCK_M=16,
+        BLOCK_N=32,
+        BLOCK_DMODEL=head_dim,
+        num_warps=4,
+        num_stages=1,
+    )
     return out
 
 

@@ -116,7 +116,7 @@ class T5Gemma2VllmMergedAttention(nn.Module):
         encoder_hidden_states: torch.Tensor | None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         q, _ = self.q_proj(hidden_states)
         self_k, _ = self.k_proj(hidden_states)
         self_v, _ = self.v_proj(hidden_states)
@@ -182,7 +182,12 @@ class T5Gemma2VllmDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        return residual + self.post_feedforward_layernorm(hidden_states)
+        # The online training extractor hooks post_feedforward_layernorm and
+        # therefore stores this normalized branch before the residual add.
+        # Return it alongside the normal decoder output so Eagle/DFlash sees
+        # exactly the same feature tensor during serving.
+        aux_hidden_states = self.post_feedforward_layernorm(hidden_states)
+        return residual + aux_hidden_states, aux_hidden_states
 
 
 class T5Gemma2VllmDecoder(nn.Module, EagleModelMixin):
@@ -242,13 +247,13 @@ class T5Gemma2VllmDecoder(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            hidden_states = layer(
+            hidden_states, aux_hidden_states = layer(
                 hidden_states,
                 encoder_hidden_states,
                 position_embeddings[self.config.layer_types[idx]],
                 positions,
             )
-            self._maybe_add_hidden_state(aux, idx + 1, hidden_states, None)
+            self._maybe_add_hidden_state(aux, idx + 1, aux_hidden_states, None)
         hidden_states = self.norm(hidden_states)
         return (hidden_states, aux) if aux else hidden_states
 
@@ -277,7 +282,6 @@ class T5Gemma2VllmForConditionalGeneration(
             decoder.vocab_size,
             soft_cap=decoder.final_logit_softcapping,
         )
-        self._encoder_outputs_cache: torch.Tensor | None = None
 
     def get_language_model(self) -> nn.Module:
         # Eagle/DFlash expects get_language_model().model to be an
@@ -317,10 +321,6 @@ class T5Gemma2VllmForConditionalGeneration(
         del intermediate_tensors
         if isinstance(encoder_outputs, list):
             encoder_outputs = torch.cat(encoder_outputs, dim=0)
-        if encoder_outputs is not None:
-            self._encoder_outputs_cache = encoder_outputs
-        else:
-            encoder_outputs = self._encoder_outputs_cache
         return self.model(input_ids, positions, inputs_embeds, encoder_outputs)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
